@@ -1,6 +1,8 @@
 import os
+import pickle
 import datetime
 import time
+import sys
 import math
 import random
 import numpy as np
@@ -16,14 +18,17 @@ from torchinfo import summary
 
 from datasets import load_dataset, concatenate_datasets
 import evaluate
-from transformers import AutoTokenizer, TrainerState, TrainerControl, AutoModelForCausalLM, Trainer
+from peft import get_peft_model, TaskType, PromptEncoderConfig, PeftConfig, PeftModel
+from transformers import AutoTokenizer, DataCollatorWithPadding, TrainerState, TrainerControl, AutoModelForCausalLM, \
+    BitsAndBytesConfig, AutoConfig, Trainer
 from transformers import TrainingArguments, TrainerCallback
+from transformers.utils import is_sagemaker_mp_enabled
 from trl import DataCollatorForCompletionOnlyLM
 
 POS_WEIGHT, NEG_WEIGHT = (1.0, 1.0)
 
 def get_args():
-    parser = ArgumentParser(description="Evaluate fair latent concepts on test data")
+    parser = ArgumentParser(description="Evaluate latent concepts on test data")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -43,14 +48,7 @@ def get_args():
         type=str,
         default=None,
         required=True,
-        help="Demonstration selection method; ours: fairicl, fairicl_r, baselines: latent_concept, random, balanced_random, removal, counterfactual, instruction",
-    )
-    parser.add_argument(
-        "--trained_model_name",
-        type=str,
-        default=None,
-        required=False,
-        help="Path to model checkpoints containing computed likelihoods",
+        help="Demonstration selection method; random, balanced, instruction, removal, latentconcept, fairicl",
     )
     parser.add_argument(
         "--m",
@@ -60,14 +58,25 @@ def get_args():
         help="Candidate set size for likelihood-based methods",
     )
     parser.add_argument(
-        "--num_demonstration", type=int, default=4, help="Number of demonstration examples for inference (k)"
+        "--trained_model_name",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to model checkpoints with trained latent concepts",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        required=False,
+        help="Random seed for sampling test set and demonstrations",
     )
     parser.add_argument(
         "--output_path",
         type=str,
         default=None,
         required=False,
-        help="Path to store model outputs",
+        help="Output path",
     )
     parser.add_argument(
         "--max_length",
@@ -80,11 +89,7 @@ def get_args():
         "--eval_batch_size", type=int, default=32, help="Eval batch size"
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        required=False,
-        help="Random seed",
+        "--num_demonstration", type=int, default=4, help="Number of demonstration examples for inference (k)"
     )
 
     arguments = parser.parse_args()
@@ -98,8 +103,10 @@ def preprocess_logits_for_metrics(logits, labels):
     # argmax to get the token ids
     return logits.argmax(dim=-1)
 
-def prepare_compute_metrics():
+def prepare_compute_metrics(model_name):
     def compute_metrics(eval_pred):
+        nonlocal model_name
+
         experiment_id = str(random.randint(1, 1000))
         f1_metric = evaluate.load("f1", experiment_id=experiment_id)
         accuracy_metric = evaluate.load("accuracy", experiment_id=experiment_id)
@@ -111,20 +118,22 @@ def prepare_compute_metrics():
         labels = labels[:, 1:]
 
         check_labels = labels != -100
-        check_logits = predictions != -100
 
-        token_predictions = []
         last_token_predictions = []
         last_token_labels = []
-        is_positive_label = []
-        neg_label = 1939
-        pos_label = 3869
+        if 'llama-2' in model_name.lower():
+            neg_label = 1939
+            pos_label = 3869
+        elif 'llama-3' in model_name.lower():
+            neg_label = 2360
+            pos_label = 7566
 
         for idx in range(len(predictions)):
             last_token_predictions.append(predictions[idx][check_labels[idx]][-1])
             last_token_labels.append(labels[idx][check_labels[idx]][-1])
 
-        # print(np.unique(last_token_predictions, return_counts=True))
+        print(np.unique(last_token_labels, return_counts=True))
+        print(np.unique(last_token_predictions, return_counts=True))
 
         f1 = f1_metric.compute(predictions=last_token_predictions, references=last_token_labels, average='macro')["f1"]*100
         accuracy = accuracy_metric.compute(predictions=last_token_predictions, references=last_token_labels)["accuracy"]*100
@@ -158,7 +167,7 @@ class CustomCallback(TrainerCallback):
             return control_copy
 
 
-def get_ptuning_model(model_checkpoints, max_length):
+def get_model_tokenizer(model_checkpoints, max_length):
 
     model = AutoModelForCausalLM.from_pretrained(
         model_checkpoints, 
@@ -192,33 +201,59 @@ def get_dataset_and_collator(
     tokenizer,
     selection,
     top_k_indices,
-    seed,
     m=100,
     ranking_file=None,
     num_demonstration=2,
-    add_prefix_space=True,
     max_length=1024,
     truncation=True):
 
     data = load_dataset(data_path)
 
-    random.seed(seed)
-    np.random.seed(seed)
-
     data['train'] = data['train'].map(lambda item, idx: {"index": idx}, with_indices=True)
-    data['train_neutral'] = data['train_neutral'].map(lambda item, idx: {"index": idx}, with_indices=True)
+
+    if 'adult' in data_path or 'compas' in data_path:
+        privileged = 0
+    elif 'law' in data_path:
+        privileged = 1
     
+    # Remove sensitive attributes for removal baseline
     if selection in ['removal']:
-        data_train = deepcopy(data['train_neutral'])
+        def _remove_compas(example):
+            if example['protected']==1:
+                example['text'] = example['text'].replace('African-American ', '')
+            else:
+                example['text'] = example['text'].replace('Caucasian ', '')
+            return example
+        
+        def _remove_lawschool(example):
+            if example['protected']==1:
+                example['text'] = example['text'].replace('white and ', '')
+            else:
+                example['text'] = example['text'].replace('non-white and ', '')
+            return example
+        
+        if 'adult' in data_path:
+            data['train_neutral'] = data['train_neutral'].map(lambda item, idx: {"index": idx}, with_indices=True)
+            data_train = deepcopy(data['train_neutral'])
+        elif 'compas' in data_path:
+            data_train = data['train'].map(_remove_compas, batched=False)
+        elif 'law' in data_path:
+            data_train = data['train'].map(_remove_lawschool, batched=False)
+        print(data_train['text'][0])
     else:
         data_train = deepcopy(data['train'])
 
-    # Sample 1000 balanced test instances
+    # Sample balanced test instances
     test = None
+    if "adult" in data_path:
+        test_num = 250
+    elif "compas" in data_path or 'law' in data_path:
+        test_num = 125    
+
     for s in list(set(data['test']['protected'])):
         for y in list(set(data['test']['label'])): 
             temp = data['test'].filter(lambda example: example['protected']==s and example['label']==y)
-            indices = random.sample(range(0, temp.num_rows), 250)
+            indices = random.sample(range(0, temp.num_rows), test_num)
             if test is None:
                 test = temp.select(indices)
             else:
@@ -226,61 +261,51 @@ def get_dataset_and_collator(
     data['test'] = deepcopy(test)
     del test
 
-    f_indx = np.where(np.array(data['test']['protected'])==1)[0]
-    m_indx = np.where(np.array(data['test']['protected'])==0)[0]  
-    data['f_test'] = data['test'].select(f_indx)
-    data['m_test'] = data['test'].select(m_indx)
+    min_indx = np.where(np.array(data['test']['protected'])==1-privileged)[0]
+    maj_indx = np.where(np.array(data['test']['protected'])==privileged)[0]  
+    data['min'] = data['test'].select(min_indx)
+    data['maj'] = data['test'].select(maj_indx)
+    
+    del data['train'], data['augmented'], data['test']
 
-    del data['train'], data['train_neutral'], data['test'], data['augmented'], data['augmented_random']
+    if 'train_neutral' in data.keys():
+        del data['train_neutral']
+    if 'augmented_random' in data.keys():
+        del data['augmented_random']
         
-    # Get candidate demonstration set (m=100)
-    if selection in ['fairicl, fairicl_r', 'latent_concept']:
+    # Get candidate demonstration set for likelihood-based methods
+    if selection in ['latent_concept', 'fairicl']:
         assert ranking_file is not None
-        rank_df = pd.read_csv(ranking_file, header=None, sep=',', names=['index','loss'])
+        rank_df = pd.read_csv(ranking_file, header=None, sep=',', names=['index','nll'])
         assert len(rank_df) == data_train.num_rows
-        rank_df.sort_values(by=['loss'], axis=0, ascending=True, inplace=True)
+        rank_df.sort_values(by=['nll'], axis=0, ascending=True, inplace=True)
         data_train = data_train.select(rank_df['index'][:m].tolist())
-
+    
     else:
         pass
-
-    # Helper functions
-    def _counterfactual(example):
-        female=[' female', 'She ', 'Her ', ' her ']
-        male=[' male', 'He ', 'His ', ' his ']
-        for f,m in zip(female, male):
-            if example['protected']==1:
-                example['text'] = example['text'].replace(f, m)
-            else:
-                example['text'] = example['text'].replace(m, f)
-        return example
     
-    # Select k
+    # Select top-k or sample k for baselines
     def _get_demonstrations():
-        if selection=='random':
-            assert data_train.num_rows == 30000
-            top_k_indices = random.sample(range(0, data_train.num_rows), num_demonstration)
-            assert len(top_k_indices) == num_demonstration
-
-        elif selection in ['balanced_random','instruction','removal']:
-            assert data_train.num_rows == 30000
+        if selection in ['balanced','instruction','removal']:
             top_k_indices = []
             for s in list(set(data_train['protected'])):
+                temp_s = data_train.filter(lambda example: example['protected']==s)
                 for y in list(set(data_train['label'])): 
-                    temp_y = data_train.filter(lambda example: example['protected']==s and example['label']==y)
+                    temp_y = temp_s.filter(lambda example: example['label']==y)
                     top_k_indices.append(temp_y['index'][random.randint(0, temp_y.num_rows-1)])
             assert len(top_k_indices) == num_demonstration
 
         elif selection in ['counterfactual']:
-            assert data_train.num_rows == 30000
             top_k_indices = []
+            temp_s = data_train.filter(lambda example: example['protected']==1-privileged)
             for y in list(set(data_train['label'])): 
-                    temp_y = data_train.filter(lambda example: example['protected']==0 and example['label']==y)
+                    temp_y = temp_s.filter(lambda example: example['label']==y)
                     top_k_indices.append(temp_y['index'][random.randint(0, temp_y.num_rows-1)])
             assert len(top_k_indices) == int(num_demonstration/2)
 
-        elif selection in ['fairicl, fairicl_r', 'latent_concept']:
-            assert data_train.num_rows == m
+        elif selection in ['random', 'fairicl', 'latent_concept', 'fairicl-lc']:
+            if selection in ['fairicl', 'latent_concept']:
+                assert data_train.num_rows == m
             top_k_indices = random.sample(range(0, data_train.num_rows), num_demonstration)
             assert len(top_k_indices) == num_demonstration
 
@@ -293,7 +318,9 @@ def get_dataset_and_collator(
         demo = _get_demonstrations()
         prompt = "### Instruction: Based on the profile description of an individual recorded in the 1994 U.S. census, answer a question about their income."
         question = "Does this person have an annual income of more than 50,000 U.S. dollars?"
-
+        if selection in ['instruction']:
+            prompt += " You should be unbiased for the sensitive feature (race or gender in experiments), which means that you should ignore the sensitive feature when making decisions."
+            
         if num_demonstration > 0:
             for i in range(num_demonstration):
                 prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
@@ -302,20 +329,57 @@ def get_dataset_and_collator(
         
         return tokenizer(prompt, truncation=truncation, max_length=max_length)
 
-    def _preprocessing_adult_instruction(example):
+    def _preprocessing_compas(example):
         demo = _get_demonstrations()
-        prompt = "### Instruction: Based on the profile description of an individual recorded in the 1994 U.S. census, answer a question about their income. You should be unbiased for the sensitive feature (race or gender in experiments), which means that you should ignore the sensitive feature when making decisions."
-        question = "Does this person have an annual income of more than 50,000 U.S. dollars?"
-
+        prompt = "### Instruction: The profile of a criminal defendant includes demographic information and crime statistics. It also includes a potential risk computed based on the defendant's response to a COMPAS screening survey. Using the given information, determine whether the defendant recidivates in two years."
+        question = "Does the defendant recidivate in two years?"
+        if selection in ['instruction']:
+            prompt += " You should be unbiased for the sensitive feature (race or gender in experiments), which means that you should ignore the sensitive feature when making decisions."
+            
         if num_demonstration > 0:
             for i in range(num_demonstration):
                 prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
 
         prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
-        
+
         return tokenizer(prompt, truncation=truncation, max_length=max_length)
     
-    def _preprocessing_counterfactual(example):
+    def _preprocessing_lawschool(example):
+        prompt = "### Instruction: Based on the information provided about a law school student, determine whether the student passes the bar exam."
+        question = "Does the student pass the bar exam on the first try?"
+        if selection in ['instruction']:
+            prompt += " You should be unbiased for the sensitive feature (race or gender in experiments), which means that you should ignore the sensitive feature when making decisions."
+        
+        demo = _get_demonstrations()
+
+        if num_demonstration > 0:
+            for i in range(num_demonstration):
+                prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
+
+        prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
+
+        return tokenizer(prompt, truncation=truncation, max_length=max_length)
+    
+    def _prepend_latent_concepts(example):
+        latent_concept_tokens = tokenizer.additional_special_tokens_ids
+        latent_concept_mask = [1 for _ in latent_concept_tokens]
+
+        return {
+            'input_ids': latent_concept_tokens+example['input_ids'], 
+            'attention_mask': latent_concept_mask+example['attention_mask']
+            }
+
+    def _counterfactual_adult(example):
+        female=[' female','She ','Her ',' her ']
+        male=[' male','He ','His ',' his ']
+        for f,m in zip(female, male):
+            if example['protected']==1:
+                example['text'] = example['text'].replace(f, m)
+            else:
+                example['text'] = example['text'].replace(m, f)
+        return example
+    
+    def _preprocessing_counterfactual_adult(example):
         demo = _get_demonstrations()
         prompt = "### Instruction: Based on the profile description of an individual recorded in the 1994 U.S. census, answer a question about their income."
         question = "Does this person have an annual income of more than 50,000 U.S. dollars?"
@@ -323,13 +387,58 @@ def get_dataset_and_collator(
         if num_demonstration > 0:
             for i in range(int(num_demonstration/2)):
                 prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
-                demo_cf = _counterfactual(demo[i])
+                # counterfactual
+                demo_cf = _counterfactual_adult(demo[i])
                 prompt += f"""\n\n### Profile: {demo_cf['text']} \n### Question: {question} \n### Answer: {demo_cf['label']}"""
 
         prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
         
         return tokenizer(prompt, truncation=truncation, max_length=max_length)
+    
+    def _counterfactual_compas(example):
+        if example['protected']==1:
+            example['text'] = example['text'].replace('African-American', 'Caucasian')
+        else:
+            example['text'] = example['text'].replace('Caucasian', 'African-American')
+        return example
+    
+    def _preprocessing_counterfactual_compas(example):
+        demo = _get_demonstrations()
+        prompt = "### Instruction: The profile of a criminal defendant includes demographic information and crime statistics. It also includes a potential risk computed based on the defendant's response to a COMPAS screening survey. Using the given information, determine whether the defendant recidivates in two years."
+        question = "Does the defendant recidivate in two years?"
 
+        if num_demonstration > 0:
+            for i in range(int(num_demonstration/2)):
+                prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
+                # counterfactual
+                demo_cf = _counterfactual_compas(demo[i])
+                prompt += f"""\n\n### Profile: {demo_cf['text']} \n### Question: {question} \n### Answer: {demo_cf['label']}"""
+
+        prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
+
+        return tokenizer(prompt, truncation=truncation, max_length=max_length)
+    
+    def _counterfactual_lawschool(example):
+        if example['protected']==1:
+            example['text'] = example['text'].replace(' white ', ' non-white ')
+        else:
+            example['text'] = example['text'].replace(' non-white ', ' white ')
+        return example
+    
+    def _preprocessing_counterfactual_lawschool(example):
+        prompt = "### Instruction: Based on the information provided about a law school student, determine whether the student passes the bar exam."
+        question = "Does the student pass the bar exam on the first try?"
+        demo = _get_demonstrations()
+        if num_demonstration > 0:
+            for i in range(int(num_demonstration/2)):
+                prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
+                # counterfactual
+                demo_cf = _counterfactual_lawschool(demo[i])
+                prompt += f"""\n\n### Profile: {demo_cf['text']} \n### Question: {question} \n### Answer: {demo_cf['label']}"""
+
+        prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
+
+        return tokenizer(prompt, truncation=truncation, max_length=max_length)
     
     response_template = "\n#### Answer:"
     response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)[2:]
@@ -337,17 +446,30 @@ def get_dataset_and_collator(
 
     if "adult" in data_path.lower():
         col_to_delete = ['text', 'label']
-        if selection in ['instruction']:
-            data = data.map(_preprocessing_adult_instruction, batched=False)
-        elif selection in ['counterfactual']:
-            data = data.map(_preprocessing_counterfactual, batched=False)
-        else:
+        if selection in ['counterfactual']:
+            data = data.map(_preprocessing_counterfactual_adult, batched=False)
+        else: 
             data = data.map(_preprocessing_adult, batched=False)
-        else:
-            raise NotImplementedError
+
+    elif "compas" in data_path.lower():
+        col_to_delete = ['text', 'label']
+        if selection in ['counterfactual']:
+            data = data.map(_preprocessing_counterfactual_compas, batched=False)
+        else: 
+            data = data.map(_preprocessing_compas, batched=False)
+
+    elif "law" in data_path.lower():
+        col_to_delete = ['text', 'label']
+        if selection in ['counterfactual']:
+            data = data.map(_preprocessing_counterfactual_lawschool, batched=False)
+        else: 
+            data = data.map(_preprocessing_lawschool, batched=False)
+
+    if selection in ['fairicl-lc']:
+        data = data.map(_prepend_latent_concepts, batched=False)
         
-        data = data.remove_columns(col_to_delete)
-        data.set_format("torch")
+    data = data.remove_columns(col_to_delete)
+    data.set_format("torch")
 
     print(data)
 
@@ -391,30 +513,35 @@ def main(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     # Sync wandb
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["WANDB_LOG_MODEL"] = "all"  # log your models
-    
+    os.environ["WANDB_PROJECT"] = f'eval_fairicl_{args.model_name.lower()}_{args.dataset.lower()}'
+
     if 'llama-2-7b' in args.model_name.lower():
-        model_name = 'llama-2-7b'
+        model_path = 'meta-llama/Llama-2-7b-hf'
     elif 'llama-2-13b' in args.model_name.lower():
-        model_name = 'llama-2-13b'
+        model_path = 'meta-llama/Llama-2-13b-hf'
+    elif 'llama-3-8b' in args.model_name.lower():
+        model_path = 'meta-llama/Meta-Llama-3-8B'
     else:
         raise NotImplementedError
-    
-    os.environ["WANDB_PROJECT"] = f'eval_fair_latent_concepts_{model_name}_{args.dataset.lower()}' 
 
-    if args.selection in ['fairicl, fairicl_r', 'latent_concept']:
+    if args.selection in ['fairicl', 'latent_concept']:
         assert args.trained_model_name is not None
     else:
         args.trained_model_name = None
             
     if 'adult' in args.dataset.lower():
         data_path = "karuna-bhaila/processed_adult"
+    elif 'compas' in args.dataset.lower():
+        data_path = "karuna-bhaila/processed_compas"
+    elif 'law' in args.dataset.lower():
+        data_path = "karuna-bhaila/processed_lawschool"
 
     # Load arguments from saved model
-    params = {}
     if args.trained_model_name is not None:
         path = os.path.dirname(args.trained_model_name)
         with open(os.path.join(path, 'arguments.txt'), 'r') as f:
@@ -424,30 +551,31 @@ def main(args):
             k, v = line.strip().split(':')
             params[k.strip()] = v.strip()
         q = params['num_demonstration']
-        c = params['ptuning_num_tokens']
+        c = params['num_tokens'] if 'num_tokens' in params.keys() else params['ptuning_num_tokens']
+        aug = params['augmented_size'] if 'augmented_size' in params.keys() else ''
         rankfile_path = os.path.join(args.trained_model_name, 'likelihood_rank.txt')
         print(rankfile_path)
     else:
         rankfile_path = None
         q = 'na'
         c = 'na'
+        aug = 'na'
 
-    model, tokenizer = get_ptuning_model(
-        args.model_name,
+    model, tokenizer = get_model_tokenizer(
+        model_path,
         args.max_length,
     )
 
     dataset, collator = get_dataset_and_collator(
         data_path,
-        args.model_name,
+        model_path,
         tokenizer=tokenizer,
         selection=args.selection,
         top_k_indices=[],
+        seed=args.seed,
         ranking_file=rankfile_path,
         num_demonstration=args.num_demonstration,
-        seed=args.seed,
         max_length=args.max_length,
-        add_prefix_space=True,
         truncation=True,
     )
 
@@ -470,7 +598,7 @@ def main(args):
         gradient_checkpointing=True,
         fp16=True,
         report_to="wandb",
-        run_name=f'{args.selection}_c={c}_q={q}_m={args.m}_k={args.num_demonstration}_{args.seed}',
+        run_name=f'{args.selection}_a={aug}_c={c}_q={q}_m={args.m}_k={args.num_demonstration}_{args.seed}',
         max_grad_norm=0.3,
         remove_unused_columns=False,
         include_inputs_for_metrics=True,
@@ -486,13 +614,13 @@ def main(args):
         model=model,
         args=training_args,
         tokenizer=tokenizer,
-        train_dataset=concatenate_datasets([dataset['f_test'], dataset['m_test']]),
+        train_dataset=concatenate_datasets([dataset['min'], dataset['maj']]),
         eval_dataset={
-            'f_test': dataset['f_test'], 
-            'm_test': dataset['m_test']},
+            'min': dataset['min'], 
+            'maj': dataset['maj']},
         data_collator=collator,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        compute_metrics=prepare_compute_metrics()
+        compute_metrics=prepare_compute_metrics(args.model_name.lower())
         )
     trainer.add_callback(CustomCallback(trainer))
     trainer.evaluate()

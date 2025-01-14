@@ -1,6 +1,8 @@
 import os
+import pickle
 import datetime
 import time
+import sys
 import random
 import numpy as np
 from tqdm import tqdm
@@ -14,7 +16,7 @@ from torchinfo import summary
 
 from datasets import load_dataset, concatenate_datasets
 import evaluate
-from transformers import AutoTokenizer, DataCollatorWithPadding, TrainerState, TrainerControl, AutoModelForCausalLM, Trainer
+from transformers import AutoTokenizer, TrainerState, TrainerControl, AutoModelForCausalLM, Trainer
 from transformers import TrainingArguments, TrainerCallback
 from transformers.utils import is_sagemaker_mp_enabled
 from trl import DataCollatorForCompletionOnlyLM
@@ -42,12 +44,12 @@ def get_args():
         type=str,
         default='train',
         required=True,
-        help="Whether to train latent concept tokens or compute likelihood"
+        help="Whether to train latet concept tokens or compute likelihood"
     )
     parser.add_argument(
         "--augmented_size",
         type=float,
-        default=1.0,
+        default=0.0,
         required=False,
         help="size of augmented dataset relative to original training data"
     ),
@@ -88,7 +90,7 @@ def get_args():
         "--weight_decay", type=float, default=0.001, help="Weight decay"
     )
     parser.add_argument(
-        "--ptuning_num_tokens", type=int, default=10, help="Number of learnable tokens (c)"
+        "--num_tokens", type=int, default=10, help="Number of learnable tokens (c)"
     )
     parser.add_argument(
         "--num_demonstration", type=int, default=2, help="Number of demonstration examples (q)"
@@ -105,55 +107,42 @@ def preprocess_logits_for_metrics(logits, labels):
     # argmax to get the token ids
     return logits.argmax(dim=-1)
 
-def prepare_compute_metrics(tokenizer, mode=None):
+def prepare_compute_metrics(model_name):
     def compute_metrics(eval_pred):
-        nonlocal tokenizer
-        nonlocal mode
+        nonlocal model_name
 
         experiment_id = str(random.randint(1, 1000))
         f1_metric = evaluate.load("f1", experiment_id=experiment_id)
         accuracy_metric = evaluate.load("accuracy", experiment_id=experiment_id)
         confusion_metric = evaluate.load("confusion_matrix", experiment_id=experiment_id)
-        precision_metric = evaluate.load('precision', experiment_id=experiment_id)
-        recall_metric = evaluate.load('recall', experiment_id=experiment_id)
 
-        logits, labels, inputs = eval_pred
+        logits, labels, _ = eval_pred
 
         predictions = logits[:, :-1]
         labels = labels[:, 1:]
 
         check_labels = labels != -100
-        check_logits = predictions != -100
 
-        token_predictions = []
         last_token_predictions = []
         last_token_labels = []
 
-        neg_label = 1939   # No
-        pos_label = 3869   # Yes
+        if 'llama-2' in model_name.lower():
+            neg_label = 1939
+            pos_label = 3869
+        elif 'llama-3' in model_name.lower():
+            neg_label = 2360
+            pos_label = 7566
 
         for idx in range(len(predictions)):
             last_token_predictions.append(predictions[idx][check_labels[idx]][-1])
             last_token_labels.append(labels[idx][check_labels[idx]][-1])
-
-        # print(np.unique(last_token_predictions, return_counts=True))
 
         f1 = f1_metric.compute(predictions=last_token_predictions, references=last_token_labels, average='macro')["f1"]
         accuracy = accuracy_metric.compute(predictions=last_token_predictions, references=last_token_labels)["accuracy"]
         cm = confusion_metric.compute(predictions=last_token_predictions, references=last_token_labels, labels=[neg_label, pos_label])['confusion_matrix']
         tn, fp, fn, tp = cm.ravel()
         
-        if mode=='fairicl_lc':
-            sp = (tp+fp) / (tn+fp+fn+tp)
-            tpr = tp / (tp+fn)
-            fpr = fp / (tn+fp)
-
-            print(sp, tpr)
-            
-            return {'acc': accuracy, 'f1': f1, 'sp': sp, 'tpr': tpr, 'fpr': fpr, 'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp}
-        
-        else:
-            return {'accuracy': accuracy, 'f1-score': f1, 'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp}
+        return {'accuracy': accuracy, 'f1-score': f1, 'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp}
 
     return compute_metrics
 
@@ -177,7 +166,7 @@ class CustomCallback(TrainerCallback):
             return control_copy
 
 
-def get_ptuning_model(model_checkpoints, max_length, num_tokens):
+def get_model_tokenizer(model_checkpoints, max_length, num_tokens):
 
     base_model = AutoModelForCausalLM.from_pretrained(
         model_checkpoints, 
@@ -239,22 +228,23 @@ def get_dataset_and_collator(
     augmented_size=1,
     num_demonstration=2,
     seed=42,
-    add_prefix_space=True,
     max_length=1024,
     truncation=True,):
-
-    random.seed(seed) 
-    np.random.seed(seed)
 
     data = load_dataset(data_path)
 
     if mode in ['random_train']:
+        assert 'adult' in data_path.lower()
         data['augmented'] = deepcopy(data['augmented_random'])
-    del data['train_neutral'], data['augmented_random']
         
-    if augmented_size < 1:
+    if augmented_size is not None and augmented_size < 1:
         nrows = int(augmented_size*data['train'].num_rows)
         data['augmented'] = data['augmented'].select(random.sample(range(0, data['train'].num_rows), nrows))
+    
+    if 'train_neutral' in data.keys():
+        del data['train_neutral']
+    if 'augmented_random' in data.keys():
+        del data['augmented_random']
 
     data['train'] = data['train'].map(lambda item, idx: {"index": idx}, with_indices=True)
     data['augmented'] = data['augmented'].map(lambda item, idx: {"index": idx}, with_indices=True)
@@ -268,43 +258,40 @@ def get_dataset_and_collator(
     def _preprocessing_adult(example):
         demo = _get_demonstrations()
         prompt = "### Instruction: Based on the profile description of an individual recorded in the 1994 U.S. census, answer a question about their income."
+        question = "Does this person have an annual income of more than 50,000 U.S. dollars?"
 
         if num_demonstration > 0:
             for i in range(num_demonstration):
-                prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: Does this person have an annual income of more than 50,000 U.S. dollars? \n### Answer: {demo[i]['label']}"""
+                prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
 
-        prompt += f"""\n\n### Profile: {example['text']}  \n### Question: Does this person have an annual income of more than 50,000 U.S. dollars? \n#### Answer: {example['label']}"""
+        prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
 
         return tokenizer(prompt, truncation=truncation, max_length=max_length)
 
-    def _preprocessing_likelihood(data):
-        sampled_indices = []
-        _indices = data['index'] + data['index']
-        for indx in tqdm(range(data.num_rows)):
-            _samples = []
-            for _ in range(num_demonstration):
-                while True:
-                    rand_indx = random.sample(range(0, len(_indices)), 1)[0]
-                    if _indices[rand_indx] not in _samples:
-                        _samples.append(_indices[rand_indx])
-                        _indices.pop(rand_indx)
-                        break
-            
-            sampled_indices.append([_samples[0], _samples[1]])
+    def _preprocessing_compas(example):
+        demo = _get_demonstrations()
+        prompt = "### Instruction: The profile of a criminal defendant includes demographic information and crime statistics. It also includes a potential risk computed based on the defendant's response to a COMPAS screening survey. Using the given information, determine whether the defendant recidivates in two years."
+        question = "Does the defendant recidivate in two years?"
 
-        data = data.map(lambda item, idx: {"s_index": sampled_indices[idx]}, with_indices=True)
-        return data    
+        if num_demonstration > 0:
+            for i in range(num_demonstration):
+                prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
 
-    def _tokenize(example):
-        indices = example['s_index']
-        prompt = "### Instruction: Based on the profile description of an individual recorded in the 1994 U.S. census, answer a question about their income."
+        prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
 
-        if num_demonstration > 1:
-            for i in range(num_demonstration-1):
-                prompt += f"""\n\n### Profile: {data_train[indices[i]]['text']} \n### Question: Does this person have an annual income of more than 50,000 U.S. dollars? \n### Answer: {data_train[indices[i]]['label']}"""
+        return tokenizer(prompt, truncation=truncation, max_length=max_length)
+    
+    def _preprocessing_lawschool(example):
+        demo = _get_demonstrations()
+        prompt = "### Instruction: Based on the information provided about a law school student, determine whether the student passes the bar exam."
+        question = "Does the student pass the bar exam on the first try?"
 
-        prompt += f"""\n\n### Profile: {data_train[indices[-1]]['text']}  \n### Question: Does this person have an annual income of more than 50,000 U.S. dollars? \n#### Answer: {data_train[indices[-1]]['label']}"""
-        
+        if num_demonstration > 0:
+            for i in range(num_demonstration):
+                prompt += f"""\n\n### Profile: {demo[i]['text']} \n### Question: {question} \n### Answer: {demo[i]['label']}"""
+
+        prompt += f"""\n\n### Profile: {example['text']}  \n### Question: {question} \n#### Answer: {example['label']}"""
+
         return tokenizer(prompt, truncation=truncation, max_length=max_length)
 
     def _prepend_latent_concepts(example):
@@ -331,46 +318,32 @@ def get_dataset_and_collator(
     response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)[2:]
     data_collator = DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer=tokenizer)
 
-    if "adult" in data_path.lower():
-        col_to_delete = ['text', 'label']
+    col_to_delete = ['text', 'label']
 
-        if mode in ['train', 'resume_train', 'augmented_train', 'random_train']:
+    if mode in ['train', 'augmented_train', 'random_train']:
+        if mode in ['train']:
+            del data['augmented']
+        if "adult" in data_path.lower():
             data = data.map(_preprocessing_adult, batched=False)
-            data = data.map(_prepend_latent_concepts, batched=False)
+        elif "compas" in data_path.lower():
+            data = data.map(_preprocessing_compas, batched=False)
+        elif "law" in data_path.lower():
+            data = data.map(_preprocessing_lawschool, batched=False)
+        data = data.map(_prepend_latent_concepts, batched=False)
 
-        elif mode=='likelihood':
-            num_demonstration = 0
-            del data['augmented'], data['test']
+    elif mode=='likelihood':
+        num_demonstration = 0
+        del data['augmented'], data['test']
+        if "adult" in data_path.lower():
             data = data.map(_preprocessing_adult, batched=False)
-            data = data.map(_append_latent_concepts, batched=False)
-            
-        elif mode=='fairicl_lc':
-            del data['train'], data['augmented']
-            data = data.map(_preprocessing_adult, batched=False)
-            data = data.map(_prepend_latent_concepts, batched=False)
-            # Sample 1000 balanced test instances
-            random.seed(seed)
-            np.random.seed(seed)
-            test = None
-            for s in list(set(data['test']['protected'])):
-                for y in list(set(data['test']['label'])): 
-                    temp = data['test'].filter(lambda example: example['protected']==s and example['label']==y)
-                    indices = random.sample(range(0, temp.num_rows), 250)
-                    if test is None:
-                        test = temp.select(indices)
-                    else:
-                        test = concatenate_datasets([test, temp.select(indices)])
-            data['test'] = deepcopy(test)
-            del test
+        elif "compas" in data_path.lower():
+            data = data.map(_preprocessing_compas, batched=False)
+        elif "law" in data_path.lower():
+            data = data.map(_preprocessing_lawschool, batched=False)
+        data = data.map(_append_latent_concepts, batched=False)
 
-            f_indx = np.where(np.array(data['test']['protected'])==1)[0]
-            m_indx = np.where(np.array(data['test']['protected'])==0)[0]  
-            data['f_test'] = data['test'].select(f_indx)
-            data['m_test'] = data['test'].select(m_indx)
-            del data['test']
-
-        data = data.remove_columns(col_to_delete)
-        data.set_format("torch")
+    data = data.remove_columns(col_to_delete)
+    data.set_format("torch")
 
     print(data)
 
@@ -471,22 +444,26 @@ def get_latent_concept_loss_trainer():
                 indices.extend(sample_indices.detach().cpu().numpy().tolist()) 
                 likelihood.extend(loss.detach().cpu().numpy().tolist()) 
 
-                # print(likelihood)
-
             return indices, likelihood
 
     return LatentConceptTrainer
 
 
 def main(args):
+    # Random seeds
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
     # Sync wandb
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["WANDB_LOG_MODEL"] = "all"  # log your models
     
     if 'llama-2-7b' in args.model_name.lower():
         model_name = 'llama-2-7b'
-    elif 'llama-2-13b' in args.model_name.lower():
-        model_name = 'llama-2-13b'
+    elif 'llama-3-8b' in args.model_name.lower():
+        model_name = 'llama-3-8b'
     else:
         raise NotImplementedError
 
@@ -494,9 +471,13 @@ def main(args):
     
     if 'adult' in args.dataset.lower():
         data_path = "karuna-bhaila/processed_adult"
+    elif 'compas' in args.dataset.lower():
+        data_path = "karuna-bhaila/processed_compas"
+    elif 'law' in args.dataset.lower():
+        data_path = "karuna-bhaila/processed_lawschool"
 
     # Specify paths
-    if args.output_path is None:
+    if args.output_path is None and 'train' in args.task:
         args.output_path = f'checkpoints/fair_latent_concepts_{model_name}_{args.dataset.lower()}_{datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}'
         # write run arguments to file
         if not os.path.exists(args.output_path):
@@ -505,28 +486,28 @@ def main(args):
             for k, v in args.__dict__.items():
                 f.write(f'{k}: {v}\n')
 
-    model, tokenizer = get_ptuning_model(
+    model, tokenizer = get_model_tokenizer(
         args.model_name,
         args.max_length,
-        args.ptuning_num_tokens,
+        args.num_tokens,
     )
                 
     training_args = TrainingArguments(
         output_dir=args.output_path,
         learning_rate=args.lr,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type="linear",
         warmup_ratio=0.1,
         per_device_train_batch_size=args.train_batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         num_train_epochs=args.num_epochs,
         weight_decay=args.weight_decay,
-        evaluation_strategy="no",
+        evaluation_strategy="epoch",
         save_strategy="epoch",
         group_by_length=True,
         gradient_checkpointing=True,
         fp16=True,
         report_to="wandb",
-        run_name=f'lr={args.lr}_aug={args.augmented_size}_numtokens={args.ptuning_num_tokens}_q={args.num_demonstration}',
+        run_name=f'{args.task}_lr={args.lr}_aug={args.augmented_size}_numtokens={args.num_tokens}_q={args.num_demonstration}',
         max_grad_norm=0.3,
         remove_unused_columns=False,
         include_inputs_for_metrics=True,
@@ -547,55 +528,42 @@ def main(args):
         num_demonstration=args.num_demonstration,
         seed=args.seed,
         max_length=args.max_length,
-        add_prefix_space=True,
         truncation=True,
     )
 
-    if args.task=='train':
+    # Train model
+    if 'train' in args.task:
+        if args.task in ['augmented_train', 'random_train']:
+            dataset['train'] = concatenate_datasets([dataset['train'], dataset['augmented']])
+
         trainer = custom_loss(
             model=model,
-            num_virtual_tokens=args.ptuning_num_tokens,
+            num_virtual_tokens=args.num_tokens,
             args=training_args,
             tokenizer=tokenizer,
             train_dataset=dataset['train'],
-            eval_dataset=dataset['train'],
-            data_collator=collator,
-            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            compute_metrics=prepare_compute_metrics(tokenizer)
-            )
-        trainer.add_callback(CustomCallback(trainer))
-
-        trainer.train()
-
-    elif args.task in ['augmented_train','random_train']:
-        dataset['joint_train'] = concatenate_datasets([dataset['train'], dataset['augmented']])
-        trainer = custom_loss(
-            model=model,
-            num_virtual_tokens=args.ptuning_num_tokens,
-            args=training_args,
-            tokenizer=tokenizer,
-            train_dataset=dataset['joint_train'],
             eval_dataset={
-                "org_train": dataset['train']},
+                "org_train": dataset['train'],
+                "test": dataset['test']},
             data_collator=collator,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            compute_metrics=prepare_compute_metrics(tokenizer)
+            compute_metrics=prepare_compute_metrics(args.model_name.lower())
             )
         trainer.add_callback(CustomCallback(trainer))
-
         trainer.train()
-    
+
+    # Compute likelihood
     elif args.task=='likelihood':
-        training_args.output_dir = f'inference/temp'
+        training_args.output_dir = 'inference/temp'
         trainer = custom_loss(
             model=model,
-            num_virtual_tokens=args.ptuning_num_tokens,
+            num_virtual_tokens=args.num_tokens,
             args=training_args,
             tokenizer=tokenizer,
             train_dataset=dataset['train'],
             data_collator=collator,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            compute_metrics=prepare_compute_metrics(tokenizer)
+            compute_metrics=prepare_compute_metrics(args.model_name.lower())
             )
         trainer.add_callback(CustomCallback(trainer))
         indices, likelihood = trainer.compute_likelihood(trainer.model, dataset['train'])
@@ -606,38 +574,8 @@ def main(args):
             for idx, val in zip(indices, likelihood):
                 f.write(f'{idx},{val}\n')
 
-    elif args.task=='fairicl_lc':
-        # Load arguments from saved model
-        path = os.path.dirname(args.model_name)
-        with open(os.path.join(path, 'arguments.txt'), 'r') as f:
-            parameters = f.readlines()
-        params = {}
-        for line in parameters:
-            k, v = line.strip().split(':')
-            params[k.strip()] = v.strip()
-        q = params['num_demonstration']
-        c = params['ptuning_num_tokens']
-        aug = params['augmented_size']
-        os.environ["WANDB_PROJECT"] = f'eval_fair_latent_concepts_{model_name}_{args.dataset.lower()}' 
-        training_args.run_name = f'fairicl_lc_c={c}_q={q}_k={args.num_demonstration}_{args.seed}'
-        
-        trainer = custom_loss(
-            model=model,
-            num_virtual_tokens=args.ptuning_num_tokens,
-            args=training_args,
-            tokenizer=tokenizer,
-            train_dataset=concatenate_datasets([dataset['f_test'], dataset['m_test']]),
-            eval_dataset={
-                'f_test': dataset['f_test'], 
-                'm_test': dataset['m_test']},
-            data_collator=collator,
-            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            compute_metrics=prepare_compute_metrics(tokenizer, args.task)
-            )
-        trainer.add_callback(CustomCallback(trainer))
-        trainer.evaluate()
-
 
 if __name__ == "__main__":
     args = get_args()
     main(args)
+    

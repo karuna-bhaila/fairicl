@@ -2,11 +2,13 @@
 This repository contains code for the paper Fair In-Context Learning via Latent Concept Variables.
 
  # Abstract
-The emerging in-context learning (ICL) ability of large language models (LLMs) has prompted their use for predictive tasks in various domains with different types of data facilitated by serialization methods. However, with increasing applications in high-stakes domains, it has been shown that LLMs can inherit social bias and discrimination from their pre-training data. In this work, we investigate this inherent bias in LLMs during in-context learning with tabular data. We focus on an optimal demonstration selection approach that utilizes latent concept variables for resource-efficient task adaptation. We design data augmentation strategies that reduce correlation between predictive outcomes and sensitive variables helping to promote fairness during latent concept learning. We utilize the learned concept and select demonstrations from a training dataset to obtain fair predictions during inference while maintaining model utility. The latent concept variable is learned using a smaller internal LLM and the selected demonstrations can be used for inference with larger external LLMs. We empirically verify that the fair latent variable approach improves fairness results on tabular datasets compared to multiple heuristic demonstration selection methods.
+The emerging in-context learning (ICL) ability of large language models (LLMs) has prompted their use for predictive tasks in various domains with different datatypes, including tabular data, facilitated by serialization methods. However, with increasing applications in high-stakes domains, it has been shown that LLMs can inherit social bias and discrimination from their pre-training data. In this work, we investigate this inherent bias in LLMs during in-context learning with tabular data. We focus on an optimal demonstration selection approach that utilizes latent concept variables for resource-efficient task adaptation. We design data augmentation strategies that reduce correlation between predictive outcomes and sensitive variables helping to promote fairness during latent concept learning. We utilize the learned concept and select demonstrations from a training dataset to obtain fair predictions during inference while maintaining model utility. The latent concept variable is learned using a smaller internal LLM and the selected demonstrations can be used for inference with larger external LLMs. We empirically verify that the fair latent variable approach improves fairness results on tabular datasets compared to multiple heuristic demonstration selection methods.
 
 ## Datasets
-We evaluate our method on the Adult Income Dataset from the [UCI repository](https://archive.ics.uci.edu/dataset/2/adult). Please refer to the paper for details on constructions of the augmented dataset and the serialization template. The following link points to the huggingface dataset containing the dataset splits in natural language format after serialization.
+We evaluate our method on three datasets listed below. Please refer to the paper for details on constructions of the augmented dataset and the serialization template. The following link points to the huggingface dataset containing the dataset splits in natural language format after serialization.
 - [Adult Income](https://huggingface.co/datasets/karuna-bhaila/processed_adult)
+- [COMPAS](https://huggingface.co/datasets/karuna-bhaila/processed_compas)
+- [LawSchool](https://huggingface.co/datasets/karuna-bhaila/processed_lawschool)
 
 ## Installation and Usage
 ### Dependencies
@@ -19,22 +21,21 @@ Our results are reported with Python==3.10.14.
 ### Train
 1. To learn (fair) latent concepts:
 ```
-$ python train.py --dataset=adult --model_name=[model checkpoints or name in hf] --task=augmented_train --num_demonstration=2 \
-      --ptuning_num_tokens=10 --num_epochs=5 --train_batch_size=32 --eval_batch_size=32 --augmented_size=1 --seed=42
+$ python train.py --dataset=adult --model_name=[model checkpoints or name in hf] --task=augmented_train --num_demonstration=2 --ptuning_num_tokens=10 --num_epochs=5 --train_batch_size=32 --eval_batch_size=32 --augmented_size=1 --seed=42
 ```
-- available task: train, augmented_train, random_train
+- available tasks: train (learn latent concepts), augmented_train (learn fair latent concepts)
 
 2. To compute likelihood using learned (fair) latent concepts:
 ```
-$ python train_latent_concept.py --dataset=adult --model_name=[local path to checkpoints] --task=likelihood --num_demonstration=0 --eval_batch_size=32
+$ python train.py --dataset=adult --model_name=[local path to checkpoints] --task=likelihood --num_demonstration=0 --eval_batch_size=32
 ```
-`model_checkpoints` should point to the checkpoints of a model obtained after latent concept learning.
+`model_name` should point to the checkpoints of a model obtained after latent concept learning.
 
 ### Inference
 1. To perform inference with top-ranked demonstrations
 ```
-$ python eval_fair_latent_concept.py --dataset=adult --model_name=[model checkpoints or name in hf] --trained_model_name=[local path to checkpoints containing likelihood file] --num_demonstration=4 --selection=fairicl --m=100 --eval_batch_size=8 --seed=1
+$ python inference.py --dataset=adult --model_name=[model checkpoints or name in hf] --trained_model_name=[local path to checkpoints containing likelihood file] --num_demonstration=4 --selection=fairicl --m=100 --eval_batch_size=8 --seed=1
 ```
-`model_checkpoints` should point to the checkpoints of a model obtained after likelihood computation.
+`model_name` refers to the external LLM for inference and `trained_model_name` should point to the checkpoints of the internal llm obtained after likelihood computation.
 
-- available selection methods: fairicl, fairicl_r, latent_concept, random, balanced_random, removal, counterfactual, instruction
+- available selection methods: fairicl, latent_concept, random, balanced, removal, counterfactual, instruction
