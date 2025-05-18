@@ -5,10 +5,7 @@ This repository contains code for the paper Fair In-Context Learning via Latent 
 The emerging in-context learning (ICL) ability of large language models (LLMs) has prompted their use for predictive tasks in various domains with different datatypes, including tabular data, facilitated by serialization methods. However, with increasing applications in high-stakes domains, it has been shown that LLMs can inherit social bias and discrimination from their pre-training data. In this work, we investigate this inherent bias in LLMs during in-context learning with tabular data. We focus on an optimal demonstration selection approach that utilizes latent concept variables for resource-efficient task adaptation. We design data augmentation strategies that reduce correlation between predictive outcomes and sensitive variables helping to promote fairness during latent concept learning. We utilize the learned concept and select demonstrations from a training dataset to obtain fair predictions during inference while maintaining model utility. The latent concept variable is learned using a smaller internal LLM and the selected demonstrations can be used for inference with larger external LLMs. We empirically verify that the fair latent variable approach improves fairness results on tabular datasets compared to multiple heuristic demonstration selection methods.
 
 ## Datasets
-We evaluate our method on three datasets listed below. Please refer to the paper for details on constructions of the augmented dataset and the serialization template. The following link points to the huggingface dataset containing the dataset splits in natural language format after serialization.
-- [Adult Income](https://huggingface.co/datasets/karuna-bhaila/processed_adult)
-- [COMPAS](https://huggingface.co/datasets/karuna-bhaila/processed_compas)
-- [LawSchool](https://huggingface.co/datasets/karuna-bhaila/processed_lawschool)
+We evaluate our method on three datasets listed below. Please refer to the paper for details on constructions of the augmented dataset and the serialization template. [This link](https://tinyurl.com/fairicl) points to the huggingface dataset containing the dataset splits in natural language format after serialization.
 
 ## Installation and Usage
 ### Dependencies
